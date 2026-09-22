@@ -1,0 +1,6 @@
+node_modules/
+.env
+games.db
+games.db-shm
+games.db-wal
+games-state.json
