@@ -3,6 +3,14 @@
 ## 1. Prepare the repo
 Put these files in a GitHub repo (or a local folder if you're using the CLI):
 - `index.js`
+- `config.js`
+- `utils.js`
+- `roblox.js`
+- `embeds.js`
+- `gameUpdater.js`
+- `voice.js`
+- `commands.js`
+- `interactions.js`
 - `db.js`
 - `package.json`
 - `railway.json`
@@ -75,6 +83,8 @@ Each tracked game has its own message and its own independent update timer.
 
 ## 9. Notes on 24/7 voice presence
 - The bot joins self-muted and self-deafened (`selfMute: true`, `selfDeaf: true`) — it doesn't play or listen to any audio, it just occupies the channel.
-- If Discord drops the connection (network blip, Discord restart, etc.), the bot automatically attempts to rejoin the same channel after a short delay.
+- If Discord drops the connection (network blip, Discord restart, etc.), the bot automatically attempts to rejoin the same channel, retrying indefinitely with exponential backoff (5s → 10s → 20s → ... capped at 1 min between attempts) rather than giving up after a single failed try.
+- A **watchdog** runs every 60 seconds and independently checks whether the voice connection is actually healthy (`Ready` state). If it's not, the watchdog triggers a rejoin — this catches drops that events alone might miss.
 - The target voice channel is saved in the database (`settings` table), so after a Railway redeploy or crash, the bot automatically rejoins on startup — **as long as you're using a persistent Volume** (see section 4). Without a Volume, you'll need to re-run `/joinvoice` after each redeploy.
 - `libsodium-wrappers` is a pure-JS/WASM encryption library (no native compilation needed), used by `@discordjs/voice` to encrypt the voice connection — required even though the bot never sends audio.
+- **If the bot still leaves and doesn't come back**, check the Railway logs for `Voice reconnect attempt N failed (...)` — the message tells you why (missing `Connect`/`Speak` permission, channel deleted, or a networking issue between Railway and Discord's voice servers).
