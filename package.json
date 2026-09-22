@@ -1,7 +1,7 @@
 {
   "name": "roblox-status-bot",
   "version": "1.0.0",
-  "description": "Discord bot showing the live status of multiple Roblox games (SQLite)",
+  "description": "Discord bot showing the live status of multiple Roblox games (SQLite) + 24/7 voice presence",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +9,8 @@
   "dependencies": {
     "discord.js": "^14.14.1",
     "node-fetch": "^2.7.0",
-    "better-sqlite3": "^11.3.0"
+    "better-sqlite3": "^11.3.0",
+    "@discordjs/voice": "^0.17.0",
+    "libsodium-wrappers": "^0.7.13"
   }
 }

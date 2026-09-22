@@ -64,9 +64,17 @@ Commands registered on the server (instant).
 Then, in Discord, run `/addgame` to start tracking a game.
 
 ## 8. Available commands
-- `/addgame name:<text> universe_id:<id> place_id:<id> channel:<#channel> [interval_minutes:<n>]` — tracks a new game, posts its status immediately in the chosen channel.
+- `/addgame name:<text> universe_id:<id> place_id:<id> channel:<#channel> [interval_minutes:<n>]` — tracks a new game, posts its status immediately in the chosen channel (with the game's Roblox icon as thumbnail).
 - `/removegame name:<text>` — stops tracking a game (autocomplete available).
 - `/setinterval name:<text> interval_minutes:<n>` — changes how often a tracked game's status is refreshed.
 - `/listgames` — lists all tracked games, their channels, and update intervals.
+- `/joinvoice channel:<#voice-channel>` — bot joins and stays in that voice channel 24/7. Auto-reconnects if disconnected, and auto-rejoins the same channel after a bot restart (saved in the database).
+- `/leavevoice` — bot leaves the voice channel.
 
 Each tracked game has its own message and its own independent update timer.
+
+## 9. Notes on 24/7 voice presence
+- The bot joins self-muted and self-deafened (`selfMute: true`, `selfDeaf: true`) — it doesn't play or listen to any audio, it just occupies the channel.
+- If Discord drops the connection (network blip, Discord restart, etc.), the bot automatically attempts to rejoin the same channel after a short delay.
+- The target voice channel is saved in the database (`settings` table), so after a Railway redeploy or crash, the bot automatically rejoins on startup — **as long as you're using a persistent Volume** (see section 4). Without a Volume, you'll need to re-run `/joinvoice` after each redeploy.
+- `libsodium-wrappers` is a pure-JS/WASM encryption library (no native compilation needed), used by `@discordjs/voice` to encrypt the voice connection — required even though the bot never sends audio.

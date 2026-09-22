@@ -1,18 +1,20 @@
 /**
- * Discord Bot - Live multi-game Roblox status (SQLite)
- * -------------------------------------------------------
+ * Discord Bot - Live multi-game Roblox status (SQLite) + 24/7 voice presence
+ * -------------------------------------------------------------------------
  * Commands:
  *   /addgame name universe_id place_id channel [interval_minutes]  → track a new game
  *   /removegame name                                                → stop tracking a game
  *   /listgames                                                      → list tracked games
  *   /setinterval name interval_minutes                              → change a game's update interval
+ *   /joinvoice channel                                              → bot joins & stays in a voice channel 24/7
+ *   /leavevoice                                                     → bot leaves the voice channel
  *
  * Each game has its own message AND its own update interval,
  * managed independently (one setInterval per game). Games are stored in
  * a SQLite database (games.db) via db.js, more robust than a raw JSON file.
  *
  * Dependencies:
- *   npm install discord.js node-fetch@2 better-sqlite3
+ *   npm install discord.js node-fetch@2 better-sqlite3 @discordjs/voice libsodium-wrappers
  *
  * Run:
  *   node index.js
@@ -31,6 +33,11 @@ const {
   PermissionFlagsBits,
   ChannelType,
 } = require('discord.js');
+const {
+  joinVoiceChannel,
+  VoiceConnectionStatus,
+  entersState,
+} = require('@discordjs/voice');
 const fetch = require('node-fetch'); // v2 (CommonJS)
 const db = require('./db');
 
@@ -42,10 +49,16 @@ const CONFIG = {
   DEFAULT_INTERVAL_MINUTES: 5, // used if /addgame doesn't specify an interval
   MIN_INTERVAL_MINUTES: 1, // to avoid hammering the Roblox API / Discord rate limits
 };
+
+const VOICE_CHANNEL_SETTING_KEY = 'voiceChannelId';
 // ============================================
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates, // required to join/stay in voice channels
+  ],
 });
 
 function slugify(name) {
@@ -79,6 +92,69 @@ function startTimer(game) {
     else stopTimer(game.key); // the game was removed in the meantime
   }, ms);
   timers.set(game.key, timer);
+}
+
+// --------- 24/7 voice channel presence ---------
+let currentVoiceConnection = null;
+
+async function connectToVoice(channel) {
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: true, // doesn't need to hear anything, saves bandwidth
+    selfMute: true, // never plays or sends audio
+  });
+
+  currentVoiceConnection = connection;
+
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    // Discord sometimes disconnects briefly during moves/reconnects; try to
+    // recover in place first before treating it as a real disconnect.
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+      // it's reconnecting on its own, nothing to do
+    } catch {
+      console.warn('Voice connection lost, attempting to rejoin...');
+      connection.destroy();
+      await sleep(5000);
+      await rejoinSavedVoiceChannel();
+    }
+  });
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    console.log(`Joined voice channel: ${channel.name}`);
+  } catch (err) {
+    console.error('Failed to join voice channel:', err.message);
+    connection.destroy();
+    currentVoiceConnection = null;
+  }
+
+  return connection;
+}
+
+async function rejoinSavedVoiceChannel() {
+  const channelId = db.getSetting(VOICE_CHANNEL_SETTING_KEY);
+  if (!channelId) return;
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (channel) await connectToVoice(channel);
+  } catch (err) {
+    console.error('Could not rejoin saved voice channel:', err.message);
+  }
+}
+
+function leaveVoice() {
+  if (currentVoiceConnection) {
+    currentVoiceConnection.destroy();
+    currentVoiceConnection = null;
+  }
+  db.deleteSetting(VOICE_CHANNEL_SETTING_KEY);
 }
 
 // --------- Slash commands ---------
@@ -154,6 +230,25 @@ const commands = [
   new SlashCommandBuilder()
     .setName('listgames')
     .setDescription('List all currently tracked games')
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('joinvoice')
+    .setDescription('Bot joins and stays in a voice channel 24/7')
+    .addChannelOption((o) =>
+      o
+        .setName('channel')
+        .setDescription('Voice channel to join')
+        .addChannelTypes(ChannelType.GuildVoice)
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('leavevoice')
+    .setDescription('Bot leaves the voice channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
     .toJSON(),
 ];
 
@@ -235,8 +330,27 @@ async function fetchGameStats(universeId, gameName = universeId) {
   throw lastErr; // all retries exhausted → let the caller handle/log the final failure
 }
 
+// Fetches the game's icon from Roblox's thumbnails API. Called once per
+// game (on /addgame) and cached in the DB — icons rarely change, so there's
+// no need to re-fetch this on every status update.
+async function fetchGameThumbnail(universeId) {
+  try {
+    const res = await fetch(
+      `https://thumbnails.roblox.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png&isCircular=false`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const entry = data.data && data.data[0];
+    if (entry && entry.state === 'Completed') return entry.imageUrl;
+    return null;
+  } catch (err) {
+    console.warn('Could not fetch game thumbnail:', err.message);
+    return null;
+  }
+}
+
 function buildEmbed(game, stats) {
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0x2b2d31)
     .setTitle(`🎮 ${game.name} — Live Status`)
     .addFields(
@@ -258,6 +372,12 @@ function buildEmbed(game, stats) {
     )
     .setFooter({ text: 'Last updated' })
     .setTimestamp(new Date());
+
+  if (game.thumbnailUrl) {
+    embed.setThumbnail(game.thumbnailUrl);
+  }
+
+  return embed;
 }
 
 function buildJoinButton(game) {
@@ -345,6 +465,10 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    await interaction.deferReply({ ephemeral: true }); // thumbnail fetch adds a bit of latency
+
+    const thumbnailUrl = await fetchGameThumbnail(universeId);
+
     const newGame = db.addGame({
       key,
       name,
@@ -352,11 +476,11 @@ client.on('interactionCreate', async (interaction) => {
       placeId,
       channelId: channel.id,
       intervalMinutes,
+      thumbnailUrl,
     });
 
-    await interaction.reply({
+    await interaction.editReply({
       content: `✅ **${name}** is now tracked in ${channel}, updated every ${intervalMinutes} min.`,
-      ephemeral: true,
     });
 
     await updateGame(newGame);
@@ -429,6 +553,41 @@ client.on('interactionCreate', async (interaction) => {
       ephemeral: true,
     });
   }
+
+  if (interaction.commandName === 'joinvoice') {
+    const channel = interaction.options.getChannel('channel');
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      await connectToVoice(channel);
+      db.setSetting(VOICE_CHANNEL_SETTING_KEY, channel.id);
+      await interaction.editReply({
+        content: `🔊 Joined **${channel.name}** and will stay connected 24/7 (auto-reconnects if disconnected, and auto-rejoins after a bot restart).`,
+      });
+    } catch (err) {
+      await interaction.editReply({
+        content: `❌ Failed to join the voice channel: ${err.message}`,
+      });
+    }
+  }
+
+  if (interaction.commandName === 'leavevoice') {
+    if (!currentVoiceConnection) {
+      await interaction.reply({
+        content: "❌ I'm not currently in a voice channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    leaveVoice();
+
+    await interaction.reply({
+      content: '👋 Left the voice channel.',
+      ephemeral: true,
+    });
+  }
 });
 
 // --------- Startup ---------
@@ -440,6 +599,8 @@ client.once('ready', async () => {
   for (const game of db.getAllGames()) {
     startTimer(game);
   }
+  // auto-rejoin the voice channel saved from a previous session, if any
+  await rejoinSavedVoiceChannel();
 });
 
 client.login(CONFIG.TOKEN);
